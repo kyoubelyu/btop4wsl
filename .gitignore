@@ -53,6 +53,7 @@ build
 bin
 btop
 /obj/
+__pycache__/
 config.h
 .*/
 

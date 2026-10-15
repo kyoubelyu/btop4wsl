@@ -94,7 +94,7 @@ namespace Global {
 		{"#801414", "██████╔╝   ██║   ╚██████╔╝██║        ╚═╝    ╚═╝"},
 		{"#000000", "╚═════╝    ╚═╝    ╚═════╝ ╚═╝"},
 	};
-	const string Version = "1.4.7";
+	const string Version = "1.4.7-wsl.2";
 
 	int coreCount;
 	string overlay;
@@ -883,7 +883,7 @@ static auto configure_tty_mode(std::optional<bool> force_tty) {
 			if (cli.config_file.has_value()) {
 				Config::conf_file = cli.config_file.value();
 			} else {
-				Config::conf_file = Config::conf_dir / "btop.conf";
+				Config::conf_file = Config::conf_dir / "btop-wsl.conf";
 			}
 
 			auto log_file = Config::get_log_file();

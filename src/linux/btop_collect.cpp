@@ -55,6 +55,7 @@ tab-size = 4
 #include "../btop_log.hpp"
 #include "../btop_shared.hpp"
 #include "../btop_tools.hpp"
+#include "btop_wsl.hpp"
 
 #if defined(GPU_SUPPORT)
 	// Redefining C++ keywords fortunately has a warning in clang, however it's unavoidable here
@@ -175,6 +176,70 @@ namespace Cpu {
 
 namespace Gpu {
 	vector<gpu_info> gpus;
+	bool windows_source = false;
+	void collect_windows(bool initialize = false, bool sample = true) {
+		const auto snapshot = Wsl::read_snapshot();
+		if (initialize and gpus.empty()) windows_source = snapshot.present;
+		if (not windows_source) return;
+		bool layout_changed = false;
+		for (const auto& data : snapshot.gpus) {
+			if (std::ranges::any_of(gpus, [&](const auto& gpu) { return gpu.host_id == data.id; })) continue;
+			if (gpus.size() >= 6 or not snapshot.fresh) continue;
+			gpu_info gpu{};
+			gpu.host_source = true; gpu.host_id = data.id; gpu.pwr_state = 32;
+			gpu.pwr_max_usage = 1000; // Power meter uses the observed peak, not a fabricated board limit.
+			gpus.push_back(gpu); gpu_names.push_back(data.name);
+			layout_changed = true;
+		}
+		gpu_pwr_total_max = 0;
+		for (auto& gpu : gpus) {
+			const auto match = std::ranges::find_if(snapshot.gpus, [&](const auto& data) { return data.id == gpu.host_id; });
+			gpu.host_available = snapshot.fresh and match != snapshot.gpus.end();
+			if (not gpu.host_available) {
+				for (auto& [field, values] : gpu.gpu_percent) if (values.empty()) values.push_back(0);
+				continue;
+			}
+			const auto& data = *match;
+			auto& flags = gpu.supported_functions;
+			auto capability_mask = [&]() { return flags.gpu_utilization + (flags.gpu_clock << 1) + (flags.mem_clock << 2)
+				+ (flags.temp_info << 3) + (flags.pwr_usage << 4) + (flags.mem_used << 5) + (flags.mem_total << 6)
+				+ (flags.encoder_utilization << 7) + (flags.decoder_utilization << 8); };
+			const auto previous = capability_mask();
+			flags.gpu_utilization = data.load >= 0; flags.gpu_clock = data.clock >= 0;
+			flags.mem_clock = data.memory_clock >= 0; flags.temp_info = data.temperature >= 0;
+			flags.pwr_usage = data.power >= 0; flags.mem_used = data.memory_used >= 0;
+			flags.mem_total = data.memory_total > 0; flags.encoder_utilization = data.encoder >= 0;
+			flags.decoder_utilization = data.decoder >= 0;
+			flags.pwr_state = flags.mem_utilization = flags.pcie_txrx = false;
+			layout_changed = layout_changed or previous != capability_mask() or gpu.shared_memory != data.shared_memory;
+			gpu.shared_memory = data.shared_memory;
+			gpu.gpu_clock_speed = std::max(0ll, data.clock); gpu.mem_clock_speed = std::max(0ll, data.memory_clock);
+			gpu.pwr_usage = std::max(0ll, data.power); gpu.pwr_max_usage = std::max(gpu.pwr_usage, gpu.pwr_max_usage);
+			gpu_pwr_total_max += gpu.pwr_max_usage;
+			gpu.mem_used = std::max(0ll, data.memory_used); gpu.mem_total = std::max(0ll, data.memory_total);
+			gpu.encoder_utilization = std::clamp(data.encoder, 0ll, 100ll); gpu.decoder_utilization = std::clamp(data.decoder, 0ll, 100ll);
+			if (sample or gpu.gpu_percent.at("gpu-totals").empty()) {
+				gpu.gpu_percent.at("gpu-totals").push_back(std::clamp(data.load, 0ll, 100ll));
+				gpu.gpu_percent.at("gpu-vram-totals").push_back(gpu.mem_total > 0 ? std::clamp(gpu.mem_used * 100 / gpu.mem_total, 0ll, 100ll) : 0);
+				gpu.gpu_percent.at("gpu-pwr-totals").push_back(gpu.pwr_usage * 100 / std::max(1ll, gpu.pwr_max_usage));
+				if (data.temperature >= 0) gpu.temp.push_back(data.temperature / 1000);
+			}
+			const auto history_limit = static_cast<size_t>(std::max(40, Term::width * 2));
+			for (auto& [field, values] : gpu.gpu_percent)
+				while (values.size() > history_limit) values.pop_front();
+			while (gpu.temp.size() > 20) gpu.temp.pop_front();
+		}
+		count = gpus.size();
+		gpu_b_height_offsets.resize(gpus.size());
+		for (size_t i = 0; i < gpus.size(); ++i) {
+			const auto& flags = gpus[i].supported_functions;
+			gpu_b_height_offsets[i] = (flags.gpu_utilization or flags.temp_info) + flags.pwr_usage
+				+ (flags.encoder_utilization or flags.decoder_utilization)
+				+ (flags.mem_total or flags.mem_used) * (1 + 2*(flags.mem_total and flags.mem_used) + 2*flags.mem_utilization);
+		}
+		if (layout_changed) Global::resized = true;
+	}
+
 	//? NVIDIA data collection
 	namespace Nvml {
 		//? NVML defines, structs & typedefs
@@ -359,6 +424,8 @@ namespace Shared {
 		}
 		Cpu::cpuName = Cpu::get_cpuName();
 		Cpu::got_sensors = Cpu::get_sensors();
+		if (const auto snapshot = Wsl::read_snapshot(); snapshot.present)
+			Cpu::got_sensors = snapshot.fresh and snapshot.temperature >= 0;
 		for (const auto& [sensor, ignored] : Cpu::found_sensors) {
 			Cpu::available_sensors.push_back(sensor);
 		}
@@ -368,16 +435,17 @@ namespace Shared {
 
 		//? Init for namespace Gpu
 	#ifdef GPU_SUPPORT
+		Gpu::collect_windows(true);
 		auto shown_gpus = Config::getS("shown_gpus");
-		if (shown_gpus.contains("nvidia")) {
+		if (not Gpu::windows_source and shown_gpus.contains("nvidia")) {
 		    Gpu::Nvml::init();
 		}
 
-		if (shown_gpus.contains("amd")) {
+		if (not Gpu::windows_source and shown_gpus.contains("amd")) {
 			Gpu::Rsmi::init();
 		}
 
-		if (shown_gpus.contains("intel")) {
+		if (not Gpu::windows_source and shown_gpus.contains("intel")) {
 			Gpu::Intel::init();
 		}
 
@@ -643,6 +711,21 @@ namespace Cpu {
 	}
 
 	string get_cpuHz() {
+		const auto snapshot = Wsl::read_snapshot();
+		if (snapshot.present or not current_cpu.host_sensor_summary.empty()) {
+			vector<double> frequencies;
+			if (snapshot.fresh)
+				for (const auto& core : snapshot.cores)
+					if (core.clock >= 0) frequencies.push_back(core.clock);
+			if (frequencies.empty()) return "";
+			const auto& mode = Config::getS("freq_mode");
+			const auto [lo, hi] = std::minmax_element(frequencies.begin(), frequencies.end());
+			if (mode == "range") return normalize_frequency(*lo) + " - " + normalize_frequency(*hi);
+			if (mode == "highest") return normalize_frequency(*hi);
+			if (mode == "lowest") return normalize_frequency(*lo);
+			if (mode == "first") return normalize_frequency(frequencies.front());
+			return normalize_frequency(std::accumulate(frequencies.begin(), frequencies.end(), 0.0) / frequencies.size());
+		}
 		static int failed{};
 
 		if (failed > 4)
@@ -1052,34 +1135,29 @@ namespace Cpu {
         return value;
     }
 
-    static constexpr auto detect_active_cpus() {
+    static auto detect_active_cpus() {
         auto stream = std::ifstream { "/sys/fs/cgroup/cpuset.cpus.effective" };
         auto buf = std::string { std::istreambuf_iterator<char> { stream }, {} };
-
+        std::vector<std::int32_t> result;
         if (buf.empty()) {
-            return std::views::iota(0, Shared::coreCount) | std::ranges::to<std::vector<std::int32_t>>();
+            for (int i = 0; i < Shared::coreCount; ++i) result.push_back(i);
+            return result;
         }
-
-        return buf | std::views::split(',') | std::views::transform([](auto&& range) -> auto {
-                   auto view = std::string_view { range };
-                   auto dash = view.find('-');
-
-                   if (dash == std::string_view::npos) {
-                       // Single CPU, return iota of single element
-                       auto value = to_int(view);
-                       return std::views::iota(value, value + 1);
-                   }
-
-                   auto start = to_int(view.substr(0, dash));
-                   auto end = to_int(view.substr(dash + 1));
-                   return std::views::iota(start, end + 1);
-               }) |
-               std::views::join | std::ranges::to<std::vector<std::int32_t>>();
+        for (const auto& part : Tools::ssplit(buf, ',')) {
+            auto view = std::string_view(part);
+            const auto dash = view.find('-');
+            const auto start = to_int(view.substr(0, dash));
+            const auto end = dash == std::string_view::npos ? start : to_int(view.substr(dash + 1));
+            for (auto i = start; i <= end; ++i) result.push_back(i);
+        }
+        return result;
     }
 
 	auto collect(bool no_update) -> cpu_info& {
 		if (Runner::stopping or (no_update and not current_cpu.cpu_percent.at("total").empty())) return current_cpu;
 		auto& cpu = current_cpu;
+		const auto host = Wsl::read_snapshot();
+		const bool had_frequency = not cpuHz.empty();
 
 		if (Config::getB("show_cpu_freq"))
 			cpuHz = get_cpuHz();
@@ -1208,14 +1286,68 @@ namespace Cpu {
 			else throw std::runtime_error(fmt::format("Cpu::collect() : {}", e.what()));
 		}
 
-		if (Config::getB("check_temp") and got_sensors)
+		if (not host.present and Config::getB("check_temp") and got_sensors)
 			update_sensors();
 
 		if (Config::getB("show_battery") and has_battery)
 			current_bat = get_battery();
 
-		if (Config::getB("show_cpu_watts") and supports_watts)
+		if (not host.present and Config::getB("show_cpu_watts") and supports_watts)
 			current_cpu.usage_watts = get_cpuConsumptionWatts();
+
+		if (host.present or not cpu.host_sensor_summary.empty()) {
+		#ifdef GPU_SUPPORT
+			if (host.fresh and not host.gpus.empty() and not cpuName.empty()) {
+				Gpu::collect_windows(Gpu::gpus.empty(), false);
+				if (not Gpu::gpus.empty()) {
+					for (const auto& [key, values] : Gpu::gpus[0].gpu_percent)
+						if (not v_contains(available_fields, key)) available_fields.push_back(key);
+					for (const auto& [key, values] : Gpu::shared_gpu_percent)
+						if (not v_contains(available_fields, key)) available_fields.push_back(key);
+				}
+			}
+		#endif
+			const auto previous_count = sensor_core_count;
+			const bool was_available = cpu.host_metrics;
+			const bool had_temps = got_sensors, had_watts = supports_watts;
+			const auto old_labels = cpu.host_core_labels;
+			const auto& rows = host.threads.empty() ? host.cores : host.threads;
+			cpu.host_metrics = host.fresh and not rows.empty();
+			got_sensors = host.fresh and host.temperature >= 0;
+			supports_watts = host.fresh and host.power >= 0;
+			cpu_temp_only = false;
+			sensor_core_count = cpu.host_metrics ? rows.size() : 0;
+			cpu.host_core_labels.clear(); cpu.host_core_temps.clear(); cpu.host_core_clocks.clear();
+			cpu.host_sensor_summary = host.fresh ? "Host sensors" : "Host sensors offline";
+			if (host.fresh) {
+				if (host.temperature >= 0) {
+					cpu.temp.at(0).push_back(host.temperature / 1000);
+					while (cpu.temp.at(0).size() > 20) cpu.temp.at(0).pop_front();
+					cpu.temp_max = host.temperature_max > 0 ? host.temperature_max / 1000 : 0;
+				}
+				if (host.load >= 0) cpu.cpu_percent.at("total").back() = clamp(host.load, 0ll, 100ll);
+				cpu.usage_watts = std::max(0ll, host.power) / 1000.0f;
+				cpu.host_core_percent.resize(rows.size());
+				for (size_t i = 0; i < rows.size(); ++i) {
+					const auto& core = rows[i];
+					cpu.host_core_labels.push_back(host.threads.empty() ? core.label : "C" + core.label);
+					cpu.host_core_temps.push_back(core.temperature < 0 ? -1 : core.temperature / 1000);
+					cpu.host_core_clocks.push_back(core.clock);
+					auto& history = cpu.host_core_percent[i];
+					if (i >= old_labels.size() or old_labels[i] != cpu.host_core_labels[i]) history.clear();
+					history.push_back(core.load < 0 ? -1 : std::clamp(core.load, 0ll, 100ll));
+					while (history.size() > 40) history.pop_front();
+				}
+				for (const auto& [name, value] : host.extra) {
+					const auto [temp, unit] = celsius_to(value, Config::getS("temp_scale"));
+					cpu.host_sensor_summary += name.ends_with("RPM") ? fmt::format("  {} {}", name, value) : fmt::format("  {} {}{}", name, temp, unit);
+				}
+			}
+			if (previous_count != sensor_core_count or was_available != cpu.host_metrics or had_temps != got_sensors or had_watts != supports_watts or had_frequency != not cpuHz.empty()) {
+				redraw = true;
+				Global::resized = true;
+			}
+		}
 
 		cpu.active_cpus = std::make_optional(detect_active_cpus());
 
@@ -2004,9 +2136,12 @@ namespace Gpu {
 		// DebugTimer gpu_timer("GPU Total");
 
 		//* Collect data
-		Nvml::collect<0>(gpus.data()); // raw pointer to vector data, size == Nvml::device_count
-		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
-		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Intel::device_count
+		if (windows_source) collect_windows();
+		else {
+			Nvml::collect<0>(gpus.data());
+			Rsmi::collect<0>(gpus.data() + Nvml::device_count);
+			Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count);
+		}
 
 		//* Calculate average usage
 		long long avg = 0;
@@ -2037,7 +2172,7 @@ namespace Gpu {
 			}
 		}
 
-		shared_gpu_percent.at("gpu-average").push_back(avg / gpus.size());
+		shared_gpu_percent.at("gpu-average").push_back(gpus.empty() ? 0 : avg / gpus.size());
 		if (mem_total != 0)
 			shared_gpu_percent.at("gpu-vram-total").push_back(static_cast<long long>(round(mem_usage_total * 100.0 / mem_total)));
 		if (gpu_pwr_total_max != 0)
@@ -2208,6 +2343,7 @@ namespace Mem {
 
 		//? Get disks stats
 		if (show_disks) {
+			const auto host = Wsl::read_snapshot();
 			static vector<string> ignore_list;
 			double uptime = system_uptime();
 			auto free_priv = Config::getB("disk_free_priv");
@@ -2275,6 +2411,7 @@ namespace Mem {
 				diskread.open((fs::exists("/etc/mtab") ? fs::path("/etc/mtab") : Shared::procPath / "self/mounts"));
 				if (diskread.good()) {
 					vector<string> found;
+					std::unordered_set<string> physical_devices;
 					found.reserve(last_found.size());
 					string dev, mountpoint, fstype;
 					while (not diskread.eof()) {
@@ -2300,7 +2437,10 @@ namespace Mem {
 
 						if ((not use_fstab and not only_physical)
 						or (use_fstab and v_contains(fstab, mountpoint))
-						or (not use_fstab and only_physical and v_contains(fstypes, fstype))) {
+						or (not use_fstab and only_physical and (v_contains(fstypes, fstype)
+							or (fstype == "9p" and not Wsl::drive_letter(dev).empty())))) {
+							// Hide duplicate bind mounts of a physical device in WSL.
+							if (host.present and only_physical and not use_fstab and not physical_devices.insert(dev).second) continue;
 							found.push_back(mountpoint);
 							if (not v_contains(last_found, mountpoint)) redraw = true;
 
@@ -2438,6 +2578,30 @@ namespace Mem {
 				int64_t sectors_read, sectors_write, io_ticks, io_ticks_temp;
 				disk_ios = 0;
 				for (auto& [ignored, disk] : disks) {
+					const auto letter = Wsl::drive_letter(disk.dev.string());
+					if (not letter.empty()) {
+						disk.name = ignored;
+						disk.temperatures.clear();
+						if (host.fresh and host.disks.contains(letter)) {
+							const auto& data = host.disks.at(letter);
+							disk.temperatures = data.temperatures;
+							if (data.read >= 0 and data.write >= 0) {
+								if (not disk.host_io) redraw = true;
+								disk.host_io = true;
+								disk.io_read.push_back(data.read); disk.io_write.push_back(data.write);
+								disk.io_activity.push_back(clamp(data.activity, 0ll, 100ll));
+								while (disk.io_read.size() > static_cast<size_t>(max(20, width * 2))) disk.io_read.pop_front();
+								while (disk.io_write.size() > static_cast<size_t>(max(20, width * 2))) disk.io_write.pop_front();
+								while (disk.io_activity.size() > static_cast<size_t>(max(20, width * 2))) disk.io_activity.pop_front();
+								disk_ios++;
+								continue;
+							}
+						}
+						if (disk.host_io) {
+							disk.io_read.clear(); disk.io_write.clear(); disk.io_activity.clear();
+							disk.host_io = false; redraw = true;
+						}
+					}
 					if (disk.stat.empty() or access(disk.stat.c_str(), R_OK) != 0) continue;
 					if (disk.fstype == "zfs" && zfs_hide_datasets && zfs_collect_pool_total_stats(disk)) {
 						disk_ios++;

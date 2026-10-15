@@ -1,0 +1,40 @@
+name: btop4wsl
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: btop4wsl-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: ['true', 'false']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: |
+          python3 -m unittest discover -s tests/wsl -v
+          g++ -std=c++23 -Wall -Wextra -pedantic -fsanitize=address,undefined tests/wsl/test_snapshot.cpp -o /tmp/snapshot-test
+          /tmp/snapshot-test
+          bash -n wsl/install.sh wsl/wsl-root-setup.sh wsl/wsl-hwmon-mount.sh
+          python3 wsl/install_bridge.py --dry-run
+      - name: Build
+        run: make -j2 GPU_SUPPORT=${{ matrix.gpu }} QUIET=true
+      - name: Terminal regressions
+        if: matrix.gpu == 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/btop4wsl-test"
+          "$RUNNER_TEMP/btop4wsl-test/bin/pip" install pyte==0.8.2
+          "$RUNNER_TEMP/btop4wsl-test/bin/python" tests/wsl/verify_terminal.py --columns 120 --rows 40
+          "$RUNNER_TEMP/btop4wsl-test/bin/python" tests/wsl/verify_terminal.py --columns 80 --rows 24
+          "$RUNNER_TEMP/btop4wsl-test/bin/python" tests/wsl/verify_terminal.py --offline --recover --late-start
+          "$RUNNER_TEMP/btop4wsl-test/bin/python" tests/wsl/verify_terminal.py --mutate-gpu

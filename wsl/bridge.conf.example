@@ -1,0 +1,17 @@
+[bridge]
+# Auto discovers the Windows host in NAT or mirrored networking.
+# Set url to a complete custom LHM endpoint when needed.
+host = auto
+port = 8085
+url =
+interval = 2
+stale_after = 10
+timeout = 3
+state_dir = /var/lib/wsl-hwmon-state
+powershell = auto
+# Optional legacy hwmon compatibility; btop4wsl does not require a sysfs mount.
+export_hwmon = false
+hwmon_dir = /var/lib/wsl-hwmon
+# Leave empty to derive Intel TjMax from reported temperature/headroom pairs.
+# Unknown hardware limits remain unknown.
+cpu_temp_limit =

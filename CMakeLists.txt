@@ -12,7 +12,7 @@ endif()
 
 project("btop"
   DESCRIPTION "A monitor of resources"
-  HOMEPAGE_URL "https://github.com/aristocratos/btop"
+  HOMEPAGE_URL "https://github.com/kyoubelyu/btop4wsl"
   LANGUAGES CXX
 )
 
@@ -121,10 +121,6 @@ endif()
 check_cxx_symbol_exists("__cpp_lib_ranges" "version" HAS_CXX_RANGES)
 if(NOT HAS_CXX_RANGES)
   message(FATAL_ERROR "The compiler doesn't support std::ranges")
-endif()
-check_cxx_symbol_exists("__cpp_lib_ranges_to_container" "version" HAS_CXX_RANGES_TO_CONTAINER)
-if(NOT HAS_CXX_RANGES_TO_CONTAINER)
-  message(FATAL_ERROR "The compiler doesn't support std::ranges::to")
 endif()
 check_cxx_symbol_exists("__cpp_lib_string_contains" "version" HAS_CXX_STRING_CONTAINS)
 if(NOT HAS_CXX_STRING_CONTAINS)
